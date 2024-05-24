@@ -67,6 +67,7 @@ def showRaw(packet):
         print(end="")
 
 def sniffer(arg):
+
     targetInterface = arg.targetInterface
     isOnlyUserInfo = arg.userInfo
     isShowAllInfo = arg.showAll
